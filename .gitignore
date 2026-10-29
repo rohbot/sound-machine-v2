@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+include/secrets.h
+
+.venv-ble/
+__pycache__/
