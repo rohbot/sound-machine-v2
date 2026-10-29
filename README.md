@@ -128,6 +128,19 @@ The ATT write response confirms receipt, not application. Subscribe to Event bef
 
 BLE callbacks only enqueue commands; the main loop validates and applies them through the same control path as HTTP and USB. The audio task receives complete settings snapshots and continues independently of BLE connections.
 
+## Side buttons
+
+- **KEY1** toggles the surround LEDs on/off, preserving the selected colour and brightness.
+- **KEY2** toggles white noise. If sound is stopped, it selects white noise and starts playback. If ambient sound is playing, it switches to white noise. If white noise is already playing, it stops playback.
+
+- **KEY3** switches between white noise and ambient audio, preserving the current playing/stopped state, volume, and ambient palette. During playback, the sound changes immediately; while stopped, it changes the selected mode.
+
+The buttons are active-low inputs on the TCA9555: KEY1 = EXIO9 (port 1 bit 1), KEY2 = EXIO10 (port 1 bit 2), KEY3 = EXIO11 (port 1 bit 3). RESET and BOOT retain their hardware functions.
+
+Inputs are polled every 10 ms and must remain stable for 40 ms. Each press toggles once; holding a button does not repeat. A button held during startup or I2C recovery must be released before another press can trigger it. Failed I2C reads are ignored.
+
+Button changes use the same state and save path as Wi-Fi, BLE, and USB, so the web page and BLE state update together. White-noise playback still starts stopped after a reboot. The light button remains usable if the audio codec fails to initialize; the noise button reports audio unavailable in the USB log.
+
 ## Hardware mapping
 
 These assignments come from the [Waveshare schematic](https://files.waveshare.com/wiki/ESP32-S3-AUDIO-Board/ESP32-S3-AUDIO-Board_1.1.pdf), [documentation](https://docs.waveshare.com/ESP32-S3-AUDIO-Board), and [factory demo](https://files.waveshare.com/wiki/ESP32-S3-AUDIO-Board/ESP32-S3-AUDIO-Board-Demo.zip).
@@ -140,13 +153,14 @@ These assignments come from the [Waveshare schematic](https://files.waveshare.co
 | Speaker data output | GPIO16 |
 | Amplifier enable | TCA9555 address `0x20`, EXIO8 (port 1 bit 0), active high |
 | RGB ring | GPIO38, seven WS2812-compatible pixels, RGB order |
+| KEY1 / KEY2 / KEY3 | TCA9555 EXIO9 / EXIO10 / EXIO11, active low |
 | Flash / PSRAM | 16 MB / 8 MB octal |
 
 The local `lib/es8311` driver is included from Waveshare's Arduino demo, with its original Espressif Apache-2.0 notices. Its I2C read helper has one fix to reject short reads.
 
 If red and green appear swapped on your board revision, change `RING_PIXEL_ORDER` in `include/config.h` from `NEO_RGB` to `NEO_GRB`, then rebuild and upload.
 
-The microphone, SD slot, RTC, display, and user buttons are not used by this firmware.
+The microphone, SD slot, RTC, and display are not used by this firmware.
 
 ## API
 
@@ -180,6 +194,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -Ilib/ambient/src -Ilib/device_control/src tests/device_controls_test.cpp \
   -o /tmp/sound-machine-tests/device-controls-test
 ASAN_OPTIONS=detect_leaks=0 /tmp/sound-machine-tests/device-controls-test
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -Ilib/ambient/src -Ilib/device_control/src tests/button_controls_test.cpp \
+  -o /tmp/sound-machine-tests/button-controls-test
+ASAN_OPTIONS=detect_leaks=0 /tmp/sound-machine-tests/button-controls-test
 ```
 
 The firmware builds successfully. Seven tests exercise the embedded JavaScript with a simulated DOM and device API, including palette / texture updates, mode switching, independent lighting, serialized slider updates, and reconnect behavior. The portable engine tests cover strict parameter rejection, deterministic synthesis, 180 seconds of maximum-density output across all palettes, bounded output, stop, and restart under AddressSanitizer and UndefinedBehaviorSanitizer. The mobile page layout was also checked in headless Chrome with a simulated API.
@@ -195,6 +213,7 @@ USB diagnostics on the connected board identified DAC mute register `0x31 = 0x60
 3. Red, green, and blue selections match the LEDs; brightness and lighting off work independently of sound.
 4. After waiting at least two seconds, reset the board. Sound and lighting settings should return, with sound stopped.
 5. If you configure home Wi-Fi, verify both normal connection and boot-time fallback with that network unavailable.
+6. Press KEY1 twice to check LED on/off, and KEY2 twice to check white-noise start/stop. Press KEY3 during playback to check white-noise / ambient switching, and while stopped to check that it changes the mode without starting playback. Hold each button to confirm it triggers once, then verify the changes appear in the Wi-Fi page and BLE state.
 
 If audio initialization fails, the page keeps its lighting controls available and displays an audio error. Check the USB serial log for the codec / I2C error and verify the exact board model. An error during ongoing I2S output stops playback and requires a restart.
 
@@ -204,3 +223,5 @@ Send `d` or `status`, followed by a newline, in the USB serial monitor to print 
 USB serial also accepts `play`, `stop`, `mode ambient|white`, `palette water|moss|dusk`, and `volume|density|space|warmth 0..100` (one command per line). These update the same saved settings as the Wi-Fi page. Diagnostics include maximum block-render time and render-overrun count; each 256-frame block has an 8 ms budget at 32 kHz.
 
 The ambient synthesis engine is included in `lib/ambient`, copied from the referenced local project. This integration brings its sound palettes and synthesis controls into the Wi-Fi and BLE controls and LED page. MQTT is not configured in this firmware.
+
+Button host tests cover contact bounce, held presses, release/re-press, startup and I2C recovery, millis rollover, and white-noise selection from stopped or ambient playback. Physical button actuation still needs checking on the speaker.

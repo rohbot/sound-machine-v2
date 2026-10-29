@@ -10,6 +10,7 @@
 #include <atomic>
 #include <AmbientEngine.h>
 #include <DeviceControls.h>
+#include <ButtonControls.h>
 #include "BleControl.h"
 #include "config.h"
 #include "es8311.h"
@@ -37,6 +38,17 @@ bool playing = false, lights = true, dirty = false, prefsReady = false;
 uint8_t brightness = 100;
 uint32_t colour = 0xff4d00, changedAt = 0;
 String apName;
+device::DebouncedButton lightButton, noiseButton, modeButton;
+bool buttonsReady = false;
+uint8_t lastButtonInputs = 0xff;
+
+bool readExpander(uint8_t reg, uint8_t& value) {
+  Wire.beginTransmission(EXPANDER);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) || Wire.requestFrom(EXPANDER, uint8_t(1)) != 1) return false;
+  value = Wire.read();
+  return true;
+}
 
 void publishAudio() {
   if (audioCommands) {
@@ -67,6 +79,7 @@ void printAudioDiagnostics() {
     Serial.println();
   }
   Serial.printf("Network: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Buttons: enabled=%u port1=0x%02x (KEY1=light, KEY2=white noise, KEY3=sound mode)\n", buttonsReady, lastButtonInputs);
 }
 
 bool writeReg(uint8_t reg, uint8_t value) {
@@ -79,6 +92,13 @@ bool writeReg(uint8_t reg, uint8_t value) {
 bool amplifier(bool enabled) {
   // TCA9555 port 1 bit 0 = EXIO8 = PA_CTRL. Keep all other pins as inputs.
   return writeReg(3, enabled ? 1 : 0) && writeReg(7, 0xfe);
+}
+
+bool initButtons() {
+  // KEY1/KEY2/KEY3 are active-low EXIO9/10/11: port 1 bits 1/2/3. Preserve PA_CTRL bit 0.
+  uint8_t config, polarity;
+  return readExpander(7, config) && readExpander(5, polarity) &&
+         writeReg(7, config | 0x0e) && writeReg(5, polarity & ~0x0e);
 }
 
 void updateLights() {
@@ -220,6 +240,34 @@ void commitState(const device::State& state) {
   ble::stateChanged(stateJson().c_str());
 }
 
+void pollButtons() {
+  static uint32_t lastPoll = 0;
+  const uint32_t now = millis();
+  if (!buttonsReady || now - lastPoll < 10) return;
+  lastPoll = now;
+  uint8_t inputs;
+  if (!readExpander(1, inputs)) {
+    // A failed read is not a press. Recover without triggering a held button.
+    lightButton.reset();
+    noiseButton.reset();
+    modeButton.reset();
+    return;
+  }
+  lastButtonInputs = inputs;
+  const bool toggleLight = lightButton.update(!(inputs & 0x02), now);
+  const bool toggleNoise = noiseButton.update(!(inputs & 0x04), now);
+  const bool toggleMode = modeButton.update(!(inputs & 0x08), now);
+  if (!toggleLight && !toggleNoise && !toggleMode) return;
+  auto next = currentState();
+  if (toggleLight) next.lights = !next.lights;
+  const bool noiseChanged = toggleNoise && device::toggleWhiteNoise(next, audioReady.load());
+  if (toggleMode) next.ambientMode = !next.ambientMode;
+  if (toggleLight || noiseChanged || toggleMode) commitState(next);
+  if (toggleLight) Serial.printf("KEY1: lights %s\n", next.lights ? "on" : "off");
+  if (toggleNoise) Serial.println(noiseChanged ? (next.playing ? "KEY2: white noise on" : "KEY2: white noise off") : "KEY2: audio unavailable");
+  if (toggleMode) Serial.printf("KEY3: %s\n", next.ambientMode ? "ambient audio" : "white noise");
+}
+
 void changeState() {
   auto next = currentState();
   // Validate the entire request before applying any fields to the device.
@@ -331,11 +379,14 @@ void setup() {
   }
   ring.begin();
   updateLights();
-  if (!Wire.begin(11, 10, 400000) || !initAudio()) {
+  const bool i2cReady = Wire.begin(11, 10, 400000);
+  if (!i2cReady || !initAudio()) {
     audioReady.store(false);
     amplifier(false);
     Serial.println("Audio initialisation failed. LED and web controls remain available.");
   }
+  buttonsReady = i2cReady && initButtons();
+  if (!buttonsReady) Serial.println("Side-button initialization failed; remote controls remain available.");
   if (ble::begin(stateJson().c_str())) Serial.println("BLE advertising as SoundMachine");
   else Serial.println("BLE initialization failed; Wi-Fi and USB remain available.");
   startNetwork();
@@ -352,6 +403,7 @@ void loop() {
   server.handleClient();
   readSerial();
   serviceBle();
+  pollButtons();
   if (playing && !audioReady.load()) {
     playing = false;
     publishAudio();
